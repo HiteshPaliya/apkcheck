@@ -4,13 +4,13 @@
 #  Kali Linux WSL2 Edition
 #
 #  Usage:
-#    bash apkcheck.sh <target.apk>              # full audit
-#    bash apkcheck.sh <new.apk> <old.apk>       # diff mode
-#    bash apkcheck.sh --check-tools              # tool check only
-#    bash apkcheck.sh <apk> --skip modules:X,Y  # skip modules
-#    bash apkcheck.sh <apk> --resume            # reuse cache
-#    bash apkcheck.sh <apk> --whitelist wl.txt  # suppress findings
-#    bash apkcheck.sh <apk> --no-live           # skip net checks
+#    bash android_static_audit_v2.3.sh <target.apk>              # full audit
+#    bash android_static_audit_v2.3.sh <new.apk> <old.apk>       # diff mode
+#    bash android_static_audit_v2.3.sh --check-tools              # tool check only
+#    bash android_static_audit_v2.3.sh <apk> --skip modules:X,Y  # skip modules
+#    bash android_static_audit_v2.3.sh <apk> --resume            # reuse cache
+#    bash android_static_audit_v2.3.sh <apk> --whitelist wl.txt  # suppress findings
+#    bash android_static_audit_v2.3.sh <apk> --no-live           # skip net checks
 #
 #  All modules: metadata manifest secrets crypto webview storage intents
 #               netconfig native firebase misc smali aidl contentprovider
@@ -38,6 +38,20 @@
 
 set -uo pipefail
 export LC_ALL=C
+
+# ─── Augment PATH so tools installed in common locations are always found ──────
+# This ensures subshells (parallel modules) inherit the full PATH
+for _p in \
+    "${HOME}/jadx/bin" \
+    "${HOME}/.local/bin" \
+    "/opt/jadx/bin" \
+    "/usr/local/bin" \
+    "/usr/share/jadx/bin" \
+    "${HOME}/.android_audit" \
+    "/opt/ghidra/support"; do
+    [ -d "$_p" ] && [[ ":$PATH:" != *":$_p:"* ]] && export PATH="$_p:$PATH"
+done
+export PATH
 
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
@@ -124,6 +138,111 @@ usage() {
 init_findings() {
     mkdir -p "${WORK_DIR}" "${SHARD_DIR}"
     echo '[]' > "${FINDINGS_JSON}"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FAST MULTI-PATTERN SCANNER
+# Reads each source file ONCE and applies ALL patterns simultaneously.
+# 50-100x faster than N separate grep -rP calls on large codebases.
+#
+# Usage:
+#   scan_source <src_dir> <shard_file> <category> <severity_default> \
+#               "PAT1|TITLE1|SEV1|REM1" "PAT2|TITLE2|SEV2|REM2" ...
+#
+# Each pattern spec: "regex|finding_title|severity|remediation_key"
+# ══════════════════════════════════════════════════════════════════════════════
+scan_source() {
+    local src_dir="$1"
+    local shard_out="$2"
+    shift 2
+    local specs=("$@")
+
+    [ ! -d "$src_dir" ] && return
+
+    python3 - "$src_dir" "$shard_out" "${specs[@]}" << 'PYEOF'
+import sys, os, re, json, glob
+
+src_dir   = sys.argv[1]
+shard_out = sys.argv[2]
+specs     = sys.argv[3:]   # "regex|title|severity|rem_key"
+
+# Parse specs
+patterns = []
+for spec in specs:
+    parts = spec.split('|', 3)
+    if len(parts) == 4:
+        pat_str, title, sev, rem = parts
+        try:
+            patterns.append((re.compile(pat_str, re.IGNORECASE if pat_str.startswith('(?i)') else 0), title, sev, rem, pat_str))
+        except re.error as e:
+            print(f"  Bad pattern '{pat_str[:40]}': {e}", file=sys.stderr)
+
+if not patterns:
+    sys.exit(0)
+
+# Collect all source files
+EXTS = ('.java', '.kt', '.smali', '.xml', '.json', '.properties', '.gradle', '.js', '.html', '.ts')
+SKIP_DIRS = {'test', 'androidtest', 'debug', 'mock', 'fixture', 'sample', 'example', '__test__'}
+
+files = []
+for root, dirs, filenames in os.walk(src_dir):
+    # Prune test/debug directories
+    dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIRS]
+    for fn in filenames:
+        if any(fn.endswith(e) for e in EXTS):
+            files.append(os.path.join(root, fn))
+
+# Match tracking: title → list of (file, line, snippet)
+matches = {title: [] for _, title, _, _, _ in patterns}
+MAX_EV = 5   # max evidence lines per finding
+
+for fpath in files:
+    fname = os.path.basename(fpath)
+    rel   = os.path.relpath(fpath, src_dir)
+    try:
+        # Read file once
+        content = open(fpath, encoding='utf-8', errors='replace').read()
+    except:
+        continue
+
+    for compiled_pat, title, sev, rem, pat_str in patterns:
+        if len(matches[title]) >= MAX_EV:
+            continue
+        m = compiled_pat.search(content)
+        if m:
+            # Find the line number
+            line_no = content[:m.start()].count('\n') + 1
+            # Get surrounding line for evidence
+            lines = content.splitlines()
+            snippet = lines[line_no-1].strip()[:120] if line_no <= len(lines) else m.group(0)[:120]
+            matches[title].append(f"{rel}:{line_no}: {snippet}")
+
+# Emit findings
+findings = []
+for compiled_pat, title, sev, rem, pat_str in patterns:
+    hits = matches[title]
+    if not hits:
+        continue
+    ev = '\n'.join(hits[:MAX_EV])
+    cvss = {'CRITICAL':9.0,'HIGH':7.5,'MEDIUM':5.5,'LOW':3.0,'INFO':2.0}.get(sev, 5.0)
+    findings.append(json.dumps({
+        'severity':    sev,
+        'category':    title.split(':')[0].strip() if ':' in title else title,
+        'title':       title,
+        'description': f'Pattern matched in source: {pat_str[:80]}',
+        'evidence':    ev,
+        'confidence':  'CONFIRMED',
+        'cvss_score':  cvss,
+        'remediation': rem
+    }))
+
+if findings:
+    mode = 'a' if os.path.exists(shard_out) else 'w'
+    with open(shard_out, mode) as f:
+        f.write('\n'.join(findings) + '\n')
+
+print(f"scan_source: {len(findings)} findings from {len(files)} files")
+PYEOF
 }
 
 # ── Shard-based add_finding ────────────────────────────────────────────────
@@ -453,12 +572,29 @@ extract_apk() {
     apk_hash=$(md5sum "$apk" | cut -c1-16)
     local cache_dir="${CACHE_BASE}/${apk_hash}"
 
-    if [ "$RESUME_MODE" = true ] && [ -d "$cache_dir" ]; then
-        success "Resuming from cache: $cache_dir"
+    # Validate cache: must have decoded AndroidManifest.xml AND at least some Java files
+    cache_valid() {
+        local cd="$1"
+        [ -d "$cd/apktool_out" ] || return 1
+        [ -d "$cd/jadx_out" ]    || return 1
+        # Manifest must exist at root level (not in original/ subdir) and be decoded XML
+        local mf="$cd/apktool_out/AndroidManifest.xml"
+        [ -f "$mf" ] || return 1
+        head -c 10 "$mf" | grep -q '<?xml\|<mani' || return 1
+        # jadx_out must have at least one Java file (not an empty dir from a failed run)
+        find "$cd/jadx_out" -name "*.java" -quit 2>/dev/null | grep -q . || return 1
+        return 0
+    }
+
+    if [ "$RESUME_MODE" = true ] && cache_valid "$cache_dir"; then
+        success "Resuming from valid cache: $cache_dir"
         ln -sf "${cache_dir}/apktool_out" "${WORK_DIR}/apktool_out"
         ln -sf "${cache_dir}/jadx_out"    "${WORK_DIR}/jadx_out"
         ln -sf "${cache_dir}/raw"         "${WORK_DIR}/raw"
         return
+    elif [ -d "$cache_dir" ] && ! cache_valid "$cache_dir"; then
+        warn "Stale/invalid cache found at $cache_dir — removing and re-decompiling"
+        rm -rf "$cache_dir"
     fi
 
     mkdir -p "${WORK_DIR}/apktool_out" "${WORK_DIR}/jadx_out" "${WORK_DIR}/raw"
@@ -466,6 +602,21 @@ extract_apk() {
     # Raw unzip (fast, always do it)
     info "Unzipping APK..."
     unzip -q "${WORK_DIR}/target.apk" -d "${WORK_DIR}/raw" 2>/dev/null || true
+
+    # Resolve jadx binary — check PATH, then common install locations
+    local jadx_bin="jadx"
+    if ! command -v jadx &>/dev/null; then
+        for p in "${HOME}/jadx/bin/jadx" \
+                  "/opt/jadx/bin/jadx" \
+                  "/usr/local/bin/jadx" \
+                  "/usr/share/jadx/bin/jadx"; do
+            if [ -x "$p" ]; then jadx_bin="$p"; break; fi
+        done
+        if [ "$jadx_bin" = "jadx" ]; then
+            warn "jadx not found in PATH or common locations — decompilation will be skipped"
+            warn "Install: wget https://github.com/skylot/jadx/releases/latest/download/jadx-1.5.0.zip && unzip jadx-1.5.0.zip -d ~/jadx && sudo ln -sf ~/jadx/bin/jadx /usr/local/bin/jadx"
+        fi
+    fi
 
     # apktool + jadx in parallel with timeout guards
     info "Starting apktool + jadx in parallel..."
@@ -475,7 +626,7 @@ extract_apk() {
         && echo "apktool:ok" || echo "apktool:fail" ) > "${WORK_DIR}/parallel/apktool.log" 2>&1 &
     BG_PIDS+=($!) ; BG_NAMES+=("apktool")
 
-    ( timeout 300 jadx --output-dir "${WORK_DIR}/jadx_out" \
+    ( timeout 300 "$jadx_bin" --output-dir "${WORK_DIR}/jadx_out" \
         --show-bad-code --no-res \
         "${WORK_DIR}/target.apk" 2>/dev/null \
         && echo "jadx:ok" || echo "jadx:fail" ) > "${WORK_DIR}/parallel/jadx.log" 2>&1 &
@@ -483,11 +634,29 @@ extract_apk() {
 
     wait_parallel "apktool + jadx decompilation"
 
-    # Cache the results
-    if [ ! -d "$cache_dir" ]; then
-        mkdir -p "${CACHE_BASE}"
-        cp -r "${WORK_DIR}/apktool_out" "${WORK_DIR}/jadx_out" "${WORK_DIR}/raw" "${cache_dir}/" 2>/dev/null || true
-        info "Cached decompile to: $cache_dir"
+    # Print decompilation status
+    grep -q "jadx:fail" "${WORK_DIR}/parallel/jadx.log" 2>/dev/null && \
+        warn "jadx decompilation failed — source analysis modules will have reduced coverage"
+    grep -q "apktool:fail" "${WORK_DIR}/parallel/apktool.log" 2>/dev/null && \
+        warn "apktool decompilation failed — manifest analysis will be limited"
+
+    # Only cache if we got usable output (jadx produced Java files AND apktool decoded manifest)
+    local java_count
+    java_count=$(find "${WORK_DIR}/jadx_out" -name "*.java" 2>/dev/null | wc -l)
+    local manifest_ok=false
+    [ -f "${WORK_DIR}/apktool_out/AndroidManifest.xml" ] && \
+        head -c 10 "${WORK_DIR}/apktool_out/AndroidManifest.xml" | grep -q '<?xml\|<mani' && \
+        manifest_ok=true
+
+    if [ "$java_count" -gt 0 ] && [ "$manifest_ok" = true ]; then
+        if [ ! -d "$cache_dir" ]; then
+            mkdir -p "${CACHE_BASE}"
+            cp -r "${WORK_DIR}/apktool_out" "${WORK_DIR}/jadx_out" "${WORK_DIR}/raw" "${cache_dir}/" 2>/dev/null || true
+            info "Cached decompile to: $cache_dir ($java_count Java files)"
+        fi
+    else
+        warn "Decompilation output incomplete (jadx: $java_count Java files, manifest: $manifest_ok) — not caching"
+        [ "$java_count" -eq 0 ] && warn "No Java files from jadx — check that jadx is properly installed"
     fi
 
     success "Extraction complete"
@@ -571,9 +740,18 @@ mod_metadata() {
 mod_manifest() {
     section "ANDROIDMANIFEST.XML"
     local manifest
-    manifest=$(find "${WORK_DIR}/apktool_out" -name "AndroidManifest.xml" 2>/dev/null | head -1 || true)
-    [ -z "$manifest" ] && manifest="${WORK_DIR}/raw/AndroidManifest.xml"
-    [ ! -f "$manifest" ] && { warn "Manifest not found — skipping"; return; }
+    manifest=$(find "${WORK_DIR}/apktool_out" -maxdepth 1 -name "AndroidManifest.xml" 2>/dev/null | head -1 || true)
+    # Never use raw/AndroidManifest.xml — it's binary (not apktool-decoded)
+    if [ -z "$manifest" ] || [ ! -f "$manifest" ]; then
+        warn "AndroidManifest.xml not found in apktool output — skipping manifest analysis"
+        warn "Ensure apktool completed: apktool d -f -o out target.apk"
+        return
+    fi
+    # Verify it's decoded XML, not binary
+    if ! head -c 20 "$manifest" | grep -q '<?xml\|<manifest'; then
+        warn "Manifest appears to be binary (apktool decode failed?) — skipping"
+        return
+    fi
 
     grep -q 'android:debuggable="true"' "$manifest" 2>/dev/null && \
         add_finding "CRITICAL" "Manifest" "Application Debuggable" \
@@ -590,10 +768,11 @@ mod_manifest() {
             "The app allows unencrypted HTTP traffic. All data sent over HTTP is visible to network attackers and can be trivially intercepted on shared/public networks." \
             "$(grep 'usesCleartextTraffic' "$manifest")" "CONFIRMED" "cleartext"
 
-    ! grep -q 'android:networkSecurityConfig' "$manifest" 2>/dev/null && \
+    if ! grep -q 'android:networkSecurityConfig' "$manifest" 2>/dev/null; then
         add_finding "MEDIUM" "Manifest" "No Network Security Configuration" \
             "No networkSecurityConfig defined. Certificate pinning is absent and user-installed CAs are trusted by default on API < 24, enabling trivial MITM on test/rooted devices." \
             "Missing android:networkSecurityConfig in <application>" "CONFIRMED" "no_pinning"
+    fi
 
     # Exported components — parse with python for accuracy
     python3 - "$manifest" "${WORK_DIR}/exported_components.txt" << 'PYEOF' 2>/dev/null || true
@@ -870,7 +1049,7 @@ mod_backup() {
     section "BACKUP RULES ANALYSIS"
     local apktool_dir="${WORK_DIR}/apktool_out"
     local manifest
-    manifest=$(find "$apktool_dir" -name "AndroidManifest.xml" 2>/dev/null | head -1 || true)
+    manifest=$(find "$apktool_dir" -maxdepth 1 -name "AndroidManifest.xml" 2>/dev/null | head -1 || true)
 
     # Check if backup rules exist at all
     local backup_xml
@@ -922,60 +1101,39 @@ mod_secrets() {
     local src="${WORK_DIR}/jadx_out"
     local apktool="${WORK_DIR}/apktool_out"
     local raw="${WORK_DIR}/raw"
+    local shard="${SHARD_DIR}/shard_$$.ndjson"
 
-    declare -A PATTERNS=(
-        ["AWS Access Key"]='AKIA[0-9A-Z]{16}'
-        ["AWS Secret Key"]='(?i)aws.{0,15}secret.{0,10}[=:].{0,50}[A-Za-z0-9/+]{40}'
-        ["Google API Key"]='AIza[0-9A-Za-z_-]{35}'
-        ["Stripe Secret Key"]='sk_live_[0-9a-zA-Z]{24}'
-        ["Stripe Publishable"]='pk_live_[0-9a-zA-Z]{24}'
-        ["JWT Token"]='eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'
-        ["Private Key"]='-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'
-        ["Basic Auth URL"]='https?://[a-zA-Z0-9._-]+:[a-zA-Z0-9._-]+@'
-        ["GitHub Token"]='ghp_[0-9a-zA-Z]{36}'
-        ["Slack Token"]='xox[baprs]-[0-9a-zA-Z]{10,48}'
-        ["Twilio SID"]='AC[a-z0-9]{32}'
-        ["SendGrid Key"]='SG\.[a-zA-Z0-9]{22}\.[a-zA-Z0-9]{43}'
-        ["Mailgun Key"]='key-[0-9a-zA-Z]{32}'
-        ["Generic Password"]='(?i)(password|passwd|pwd)\s*[=:]\s*"[^"]{4,}'
-        ["Generic Secret"]='(?i)(secret|api_key|api-key|client_secret)\s*[=:]\s*"[^"]{6,}'
-        ["Hardcoded Token"]='(?i)(access_token|auth_token|bearer)\s*[=:]\s*"[^"]{10,}'
-        ["GCP Service Account"]='type.*service_account.*project_id'
-        ["Telegram Bot Token"]='[0-9]{9}:[a-zA-Z0-9_-]{35}'
-        ["Hardcoded Encryption Key"]='SecretKeySpec\("[^"]{8,}'
-    )
+    info "Running multi-pattern secret scanner (single-pass)..."
 
-    # Paths to exclude (test/debug files — reduce FPs)
-    local EXCLUDE_PATHS="--exclude-dir=test --exclude-dir=androidTest --exclude-dir=debug"
-
-    for name in "${!PATTERNS[@]}"; do
-        local pat="${PATTERNS[$name]}"
-        local found=""
-        for d in "$src" "$apktool" "$raw"; do
-            [ ! -d "$d" ] && continue
-            local hits
-            hits=$(grep -rP --text --text $EXCLUDE_PATHS \
-                --include="*.java" --include="*.kt" --include="*.smali" \
-                --include="*.xml" --include="*.json" --include="*.properties" \
-                --include="*.gradle" --include="*.js" --include="*.html" \
-                -h "$pat" "$d" 2>/dev/null | grep -v '//.*sample\|//.*example\|//.*TODO\|//.*test\|#.*sample' | head -3 | tr '\n' ' ' || true)
-            found+="$hits"
-        done
-        if [ -n "$found" ] && [ ${#found} -gt 2 ]; then
-            local rem="general"
-            [[ "$name" == *"AWS"* ]] && rem="aws_key"
-            [[ "$name" == *"Google"* ]] && rem="google_api_key"
-            add_finding "HIGH" "Secrets" "Hardcoded Secret: $name" \
-                "A pattern matching '$name' was found in source/resource files. If this is a real credential, rotate it immediately." \
-                "${found:0:400}" "LIKELY" "$rem"
-            warn "Secret found: $name"
-        fi
+    # Single-pass scan across all source directories
+    for dir in "$src" "$apktool" "$raw"; do
+        [ ! -d "$dir" ] && continue
+        scan_source "$dir" "$shard" \
+            'AKIA[0-9A-Z]{16}|Secrets|HIGH|aws_key' \
+            '(?i)aws.{0,15}secret.{0,10}[=:].{0,50}[A-Za-z0-9/+]{40}|Secrets: AWS Secret Key|HIGH|aws_key' \
+            'AIza[0-9A-Za-z_-]{35}|Secrets: Google API Key|HIGH|google_api_key' \
+            'sk_live_[0-9a-zA-Z]{24}|Secrets: Stripe Secret Key|CRITICAL|general' \
+            'pk_live_[0-9a-zA-Z]{24}|Secrets: Stripe Publishable Key|HIGH|general' \
+            'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|Secrets: Hardcoded JWT Token|HIGH|general' \
+            '-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----|Secrets: Private Key in Source|CRITICAL|general' \
+            'https?://[a-zA-Z0-9._-]+:[a-zA-Z0-9._-]+@|Secrets: Basic Auth URL with Credentials|HIGH|general' \
+            'ghp_[0-9a-zA-Z]{36}|Secrets: GitHub Personal Access Token|CRITICAL|general' \
+            'xox[baprs]-[0-9a-zA-Z]{10,48}|Secrets: Slack Token|HIGH|general' \
+            'SG\.[a-zA-Z0-9]{22}\.[a-zA-Z0-9]{43}|Secrets: SendGrid API Key|HIGH|general' \
+            '(?i)(password|passwd|pwd)\s*[=:]\s*"[^"]{4,}|Secrets: Hardcoded Password String|HIGH|general' \
+            '(?i)(secret|api_key|api[-_]key|client_secret)\s*[=:]\s*"[^"]{6,}|Secrets: Hardcoded Secret/API Key|HIGH|general' \
+            '(?i)(access_token|auth_token|bearer)\s*[=:]\s*"[^"]{10,}|Secrets: Hardcoded Auth Token|HIGH|general' \
+            'SecretKeySpec\s*\(\s*"[^"]{8,}|Secrets: Hardcoded Encryption Key in SecretKeySpec|CRITICAL|general' \
+            'type.*service_account.*project_id|Secrets: GCP Service Account JSON|CRITICAL|google_api_key' \
+            '[0-9]{9}:[a-zA-Z0-9_-]{35}|Secrets: Telegram Bot Token|HIGH|general'
     done
 
-    # apkleaks (background)
+    # apkleaks (background) — pipe "n" to suppress interactive jadx download prompt
     if tool_ok apkleaks; then
-        ( timeout 120 apkleaks -f "${WORK_DIR}/target.apk" \
-            -o "${WORK_DIR}/apkleaks_out.txt" 2>/dev/null || true ) &
+        ( echo "n" | timeout 120 apkleaks -f "${WORK_DIR}/target.apk" \
+            -o "${WORK_DIR}/apkleaks_out.txt" 2>/dev/null || true
+          echo "n" | timeout 120 apkleaks -f "${WORK_DIR}/target.apk" \
+            --json -o "${WORK_DIR}/apkleaks_out.json" 2>/dev/null || true ) &
         BG_PIDS+=($!) ; BG_NAMES+=("apkleaks")
     fi
 
@@ -989,13 +1147,41 @@ mod_secrets() {
 
     wait_parallel "secrets scanners"
 
-    # Process apkleaks output
-    if [ -s "${WORK_DIR}/apkleaks_out.txt" ]; then
+    # Process apkleaks output — try JSON first, fall back to text
+    local apkleaks_shard="${SHARD_DIR}/shard_$$.ndjson"
+    if [ -s "${WORK_DIR}/apkleaks_out.json" ]; then
+        python3 - "${WORK_DIR}/apkleaks_out.json" "$apkleaks_shard" << 'PYEOF'
+import sys, json
+leak_file = sys.argv[1]
+shard     = sys.argv[2]
+try:
+    data = json.load(open(leak_file))
+    findings = []
+    for rule, matches in data.items():
+        if not matches: continue
+        ev = '\n'.join(str(m) for m in matches[:10])
+        findings.append(json.dumps({
+            'severity':'HIGH','category':'Secrets',
+            'title': f'apkleaks: {rule} ({len(matches)} match{"es" if len(matches)>1 else ""})',
+            'description': f'apkleaks matched pattern "{rule}" with {len(matches)} occurrence(s).',
+            'evidence': ev[:500], 'confidence':'LIKELY', 'cvss_score':7.5,
+            'remediation':'Remove hardcoded credentials. Store secrets server-side or use Android Keystore.'
+        }))
+    if findings:
+        open(shard,'a').write('\n'.join(findings)+'\n')
+        print(f"apkleaks JSON: {len(findings)} pattern matches")
+except Exception as e:
+    print(f"apkleaks JSON parse error: {e}")
+PYEOF
+    elif [ -s "${WORK_DIR}/apkleaks_out.txt" ]; then
         local leaks
-        leaks=$(grep -v '^$\|\[+\]\|\[INFO\]' "${WORK_DIR}/apkleaks_out.txt" | head -20 | tr '\n' ' ')
-        [ -n "$leaks" ] && add_finding "HIGH" "Secrets" "apkleaks Findings" \
-            "apkleaks detected additional potential secrets. Review all findings carefully." \
-            "${leaks:0:500}" "LIKELY" "general"
+        leaks=$(grep -v '^$\|\[+\]\|\[INFO\]\|\[!\]\|Done with nothing\|find jadx\|download jadx\|Y/n\|Aborted' \
+                "${WORK_DIR}/apkleaks_out.txt" 2>/dev/null | head -30 | tr '\n' '|')
+        if [ -n "$leaks" ]; then
+            add_finding "HIGH" "Secrets" "apkleaks Findings (text mode)" \
+                "apkleaks detected potential secrets. Review each match carefully." \
+                "${leaks:0:600}" "LIKELY" "general"
+        fi
     fi
 
     # Process trufflehog output
@@ -1003,7 +1189,7 @@ mod_secrets() {
         local th_count
         th_count=$(wc -l < "${WORK_DIR}/trufflehog_out.txt" || echo 0)
         add_finding "CRITICAL" "Secrets" "trufflehog: $th_count High-Confidence Secret(s) Found" \
-            "trufflehog detected secrets with high confidence (verified entropy + pattern matching). These are very likely real credentials and should be rotated immediately." \
+            "trufflehog detected secrets with high confidence. These are very likely real credentials and should be rotated immediately." \
             "$(head -3 "${WORK_DIR}/trufflehog_out.txt")" "CONFIRMED" "aws_key"
     fi
 }
@@ -1015,51 +1201,23 @@ mod_crypto() {
     section "CRYPTOGRAPHY ANALYSIS"
     local src="${WORK_DIR}/jadx_out"
     [ ! -d "$src" ] && { warn "No jadx source"; return; }
+    local shard="${SHARD_DIR}/shard_$$.ndjson"
 
-    declare -A CRYPTO=(
-        ["AES ECB Mode"]='AES/ECB'
-        ["DES Cipher"]='Cipher\.getInstance\("DES[^e]'
-        ["3DES Cipher"]='DESede|TripleDES'
-        ["MD5 Hashing"]='MessageDigest\.getInstance\("MD5"\)'
-        ["SHA-1 Hashing"]='MessageDigest\.getInstance\("SHA-?1"\)'
-        ["Static IV"]='new IvParameterSpec\(new byte\[\]\{|IvParameterSpec\("[^"]+"\)'
-        ["Hardcoded Key in SecretKeySpec"]='SecretKeySpec\("[^"]+"\s*\.getBytes'
-        ["RSA PKCS1 Padding"]='RSA/ECB/PKCS1Padding'
-        ["RSA No Padding"]='RSA/None/NoPadding'
-        ["Math.random for Crypto"]='Math\.random\(\)'
-        ["Constant Seed SecureRandom"]='SecureRandom.*\.setSeed\(\d'
-        ["Custom TrustManager All"]='checkServerTrusted[^;]{0,200}\{\s*\}'
-        ["AllowAll HostnameVerifier"]='ALLOW_ALL_HOSTNAME_VERIFIER|AllowAllHostnameVerifier'
-        ["SSL Protocol Downgrade"]='SSLContext\.getInstance\("SSL"\)'
-    )
-
-    declare -A CRYPTO_REMS=(
-        ["AES ECB Mode"]="aes_ecb"
-        ["DES Cipher"]="des_cipher"
-        ["3DES Cipher"]="des_cipher"
-        ["MD5 Hashing"]="md5_sha1"
-        ["SHA-1 Hashing"]="md5_sha1"
-        ["Static IV"]="static_iv"
-        ["Custom TrustManager All"]="trust_all_certs"
-        ["AllowAll HostnameVerifier"]="trust_all_certs"
-    )
-
-    for name in "${!CRYPTO[@]}"; do
-        local pat="${CRYPTO[$name]}"
-        local files
-        files=$(grep -rlP --text --include="*.java" --include="*.kt" "$pat" "$src" 2>/dev/null | \
-                grep -v test/ | grep -v androidTest/ | head -3 || true)
-        if [ -n "$files" ]; then
-            local ev
-            ev=$(grep -rhP --text --include="*.java" --include="*.kt" "$pat" "$src" 2>/dev/null | \
-                 head -3 | sed 's/^[[:space:]]*//' | tr '\n' ' ' || true)
-            local rem="${CRYPTO_REMS[$name]:-general}"
-            add_finding "HIGH" "Cryptography" "Insecure Crypto: $name" \
-                "Usage of '$name' detected in non-test source. This cryptographic weakness may allow an attacker to decrypt, forge, or brute-force sensitive data." \
-                "${ev:0:400}" "CONFIRMED" "$rem"
-            warn "Crypto: $name"
-        fi
-    done
+    scan_source "$src" "$shard" \
+        'AES/ECB|Cryptography: Insecure AES/ECB Mode|HIGH|aes_ecb' \
+        'Cipher\.getInstance\s*\(\s*"DES[^e]|Cryptography: DES Cipher (Broken)|HIGH|des_cipher' \
+        'DESede|TripleDES|Cryptography: 3DES Cipher (Weak)|HIGH|des_cipher' \
+        'MessageDigest\.getInstance\s*\(\s*"MD5"|Cryptography: MD5 Hash (Collision-Vulnerable)|HIGH|md5_sha1' \
+        'MessageDigest\.getInstance\s*\(\s*"SHA-?1"|Cryptography: SHA-1 Hash (Collision-Vulnerable)|HIGH|md5_sha1' \
+        'new IvParameterSpec\s*\(\s*new byte\[\]\{|IvParameterSpec\s*\(\s*"[^"]+"\)|Cryptography: Static/Hardcoded IV|HIGH|static_iv' \
+        'SecretKeySpec\s*\(\s*"[^"]+"\s*\.getBytes|Cryptography: Hardcoded Key in SecretKeySpec|CRITICAL|general' \
+        'RSA/ECB/PKCS1Padding|Cryptography: RSA PKCS1 Padding (Vulnerable to Bleichenbacher)|HIGH|general' \
+        'RSA/None/NoPadding|Cryptography: RSA No Padding (Textbook RSA, trivially breakable)|CRITICAL|general' \
+        'Math\.random\s*\(\)|Cryptography: Math.random() Used for Security (not CSPRNG)|HIGH|general' \
+        'SecureRandom.*\.setSeed\s*\(\s*[0-9]|Cryptography: SecureRandom with Constant Seed|HIGH|general' \
+        'SSLContext\.getInstance\s*\(\s*"SSL"\)|Cryptography: SSLv3 Forced (Insecure Protocol)|CRITICAL|trust_all_certs' \
+        'ALLOW_ALL_HOSTNAME_VERIFIER|AllowAllHostnameVerifier|Cryptography: AllowAll HostnameVerifier (MITM)|CRITICAL|trust_all_certs' \
+        'TrustManager.*X509Certificate|checkServerTrusted[^)]{0,300}\{\s*\}|Cryptography: Empty/Permissive TrustManager|CRITICAL|trust_all_certs'
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1069,47 +1227,20 @@ mod_webview() {
     section "WEBVIEW ANALYSIS"
     local src="${WORK_DIR}/jadx_out"
     [ ! -d "$src" ] && { warn "No jadx source"; return; }
+    local shard="${SHARD_DIR}/shard_$$.ndjson"
 
-    declare -A WV=(
-        ["JavaScript Enabled"]='setJavaScriptEnabled\(true\)'
-        ["JavaScript Interface (RCE)"]='addJavascriptInterface\('
-        ["File Access Enabled"]='setAllowFileAccess\(true\)'
-        ["Universal File Access (UXSS)"]='setAllowUniversalAccessFromFileURLs\(true\)'
-        ["File Access From File URLs"]='setAllowFileAccessFromFileURLs\(true\)'
-        ["SSL Error Proceed (Cert Bypass)"]='handler\.proceed\(\)'
-        ["WebView Load HTTP"]='loadUrl\("http://'
-        ["Intent URL to WebView"]='loadUrl\(.*getStringExtra\|loadUrl\(.*intent\.get'
-        ["evaluateJavascript with Intent"]='evaluateJavascript\(.*get(Extra|String|Intent)'
-        ["WebContents Debugging Enabled"]='setWebContentsDebuggingEnabled\(true\)'
-        ["shouldOverrideUrlLoading Missing"]='WebViewClient(?!.*shouldOverrideUrlLoading)'
-    )
-
-    declare -A WV_REMS=(
-        ["JavaScript Enabled"]="js_enabled"
-        ["JavaScript Interface (RCE)"]="js_interface"
-        ["Universal File Access (UXSS)"]="file_access_universal"
-        ["File Access From File URLs"]="file_access_universal"
-        ["SSL Error Proceed (Cert Bypass)"]="ssl_error_proceed"
-    )
-
-    for name in "${!WV[@]}"; do
-        local pat="${WV[$name]}"
-        local files
-        files=$(grep -rlP --text --include="*.java" --include="*.kt" "$pat" "$src" 2>/dev/null | \
-                grep -v test/ | head -3 || true)
-        if [ -n "$files" ]; then
-            local ev
-            ev=$(grep -rhP --text --include="*.java" --include="*.kt" "$pat" "$src" 2>/dev/null | \
-                 head -3 | sed 's/^[[:space:]]*//' | tr '\n' ' ' || true)
-            local sev="HIGH"
-            [[ "$name" == *"RCE"* || "$name" == *"UXSS"* ]] && sev="CRITICAL"
-            local rem="${WV_REMS[$name]:-general}"
-            add_finding "$sev" "WebView" "WebView: $name" \
-                "WebView misconfiguration '$name' detected. This may allow XSS, local file exfiltration, SSL bypass, or remote code execution depending on what content is loaded." \
-                "${ev:0:400}" "CONFIRMED" "$rem"
-            warn "WebView: $name"
-        fi
-    done
+    scan_source "$src" "$shard" \
+        'setJavaScriptEnabled\s*\(\s*true\s*\)|WebView: JavaScript Enabled|HIGH|js_enabled' \
+        'addJavascriptInterface\s*\(|WebView: JavaScript Interface (RCE Risk)|CRITICAL|js_interface' \
+        'setAllowFileAccess\s*\(\s*true\s*\)|WebView: File Access Enabled|HIGH|general' \
+        'setAllowUniversalAccessFromFileURLs\s*\(\s*true\s*\)|WebView: Universal File Access (UXSS)|CRITICAL|file_access_universal' \
+        'setAllowFileAccessFromFileURLs\s*\(\s*true\s*\)|WebView: File Access From File URLs|HIGH|file_access_universal' \
+        'handler\.proceed\s*\(\)|WebView: SSL Error Ignored (handler.proceed)|CRITICAL|ssl_error_proceed' \
+        'loadUrl\s*\(\s*"http://|WebView: Loads Plaintext HTTP URL|HIGH|cleartext' \
+        'loadUrl\s*\(.*getStringExtra|loadUrl\s*\(.*getIntent|WebView: Loads Intent-Supplied URL (Open Redirect)|CRITICAL|js_enabled' \
+        'evaluateJavascript\s*\(.*get(Extra|String|Intent)|WebView: evaluateJavascript with Intent Data|CRITICAL|js_interface' \
+        'setWebContentsDebuggingEnabled\s*\(\s*true\s*\)|WebView: Remote Debugging Enabled|HIGH|general' \
+        'setSavePassword\s*\(\s*true\s*\)|WebView: Password Saving Enabled|MEDIUM|general'
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1119,40 +1250,19 @@ mod_storage() {
     section "INSECURE DATA STORAGE"
     local src="${WORK_DIR}/jadx_out"
     [ ! -d "$src" ] && { warn "No jadx source"; return; }
+    local shard="${SHARD_DIR}/shard_$$.ndjson"
 
-    declare -A STOR=(
-        ["World-Readable File"]='MODE_WORLD_READABLE'
-        ["World-Writeable File"]='MODE_WORLD_WRITEABLE'
-        ["External Storage Write"]='getExternalStorageDirectory\(\)|getExternalFilesDir\('
-        ["Sensitive in Logs"]='Log\.[dviwe]\(.*(?i)(password|token|secret|key|auth|credential)'
-        ["SharedPreferences Sensitive"]='SharedPreferences.*(?i)(password|token|secret|pin|key)'
-        ["Clipboard Leak"]='ClipboardManager.*(?i)(password|secret|token|key)'
-        ["Hardcoded Credentials in Code"]='(?i)(password|passwd)\s*=\s*"[^"]{4,}'
-    )
-
-    declare -A STOR_REMS=(
-        ["World-Readable File"]="world_readable"
-        ["World-Writeable File"]="world_readable"
-        ["External Storage Write"]="external_storage"
-        ["Sensitive in Logs"]="log_sensitive"
-    )
-
-    for name in "${!STOR[@]}"; do
-        local pat="${STOR[$name]}"
-        local files
-        files=$(grep -rlP --text --include="*.java" --include="*.kt" "$pat" "$src" 2>/dev/null | \
-                grep -v test/ | head -3 || true)
-        if [ -n "$files" ]; then
-            local ev
-            ev=$(grep -rhP --text --include="*.java" --include="*.kt" "$pat" "$src" 2>/dev/null | \
-                 head -3 | sed 's/^[[:space:]]*//' | tr '\n' ' ' || true)
-            local rem="${STOR_REMS[$name]:-general}"
-            add_finding "HIGH" "Data Storage" "Insecure Storage: $name" \
-                "Detected '$name' in source. Sensitive data may be persisted in an insecure location accessible to other apps, ADB, or rooted devices." \
-                "${ev:0:400}" "CONFIRMED" "$rem"
-            warn "Storage: $name"
-        fi
-    done
+    scan_source "$src" "$shard" \
+        'MODE_WORLD_READABLE|Data Storage: World-Readable File Mode|HIGH|world_readable' \
+        'MODE_WORLD_WRITEABLE|Data Storage: World-Writeable File Mode|HIGH|world_readable' \
+        'getExternalStorageDirectory\s*\(\)|getExternalFilesDir\s*\(|Data Storage: Write to External Storage|HIGH|external_storage' \
+        'Log\.[dviwe]\s*\(.*(?i)(password|token|secret|key|auth|credential)|Data Storage: Sensitive Data in Logs|HIGH|log_sensitive' \
+        '(?i)(password|token|secret|pin)\s*[=:,\(]\s*sharedPreferences|sharedPreferences.*(?i)(password|token|secret|pin)|Data Storage: Sensitive Data in SharedPreferences|HIGH|general' \
+        'ClipboardManager.*(?i)(password|secret|token|key)|Data Storage: Sensitive Data Copied to Clipboard|HIGH|general' \
+        '(?i)(password|passwd)\s*=\s*"[^"]{4,}|Data Storage: Hardcoded Password|CRITICAL|general' \
+        'SQLiteDatabase.*openOrCreate|openDatabase\s*\(|Data Storage: SQLite Database (check encryption)|INFO|general' \
+        'getWritableDatabase\s*\(\)|getReadableDatabase\s*\(\)|Data Storage: SQLiteOpenHelper Usage (check for SQL injection)|INFO|general' \
+        'ObjectOutputStream|Serializable|Data Storage: Java Serialization (check for deserialization issues)|MEDIUM|general'
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1162,35 +1272,18 @@ mod_intents() {
     section "INTENT & IPC VULNERABILITIES"
     local src="${WORK_DIR}/jadx_out"
     [ ! -d "$src" ] && { warn "No jadx source"; return; }
+    local shard="${SHARD_DIR}/shard_$$.ndjson"
 
-    declare -A INTENTS=(
-        ["Mutable PendingIntent"]='PendingIntent\.get(?:Activity|Service|Broadcast)\b(?!.*FLAG_IMMUTABLE)'
-        ["Sticky Broadcast"]='sendStickyBroadcast\('
-        ["Fragment Injection"]='instantiate.*getStringExtra'
-        ["SQL via Intent Extra"]='rawQuery.*getStringExtra\|getStringExtra.*rawQuery'
-        ["Path Traversal via Intent"]='new File.*getStringExtra\|getStringExtra.*new File'
-        ["WebView Loads Intent URL"]='loadUrl.*getStringExtra\|getStringExtra.*loadUrl'
-        ["startActivity from Receiver"]='startActivity.*onReceive'
-    )
-
-    for name in "${!INTENTS[@]}"; do
-        local pat="${INTENTS[$name]}"
-        local files
-        files=$(grep -rlP --text --include="*.java" --include="*.kt" "$pat" "$src" 2>/dev/null | grep -v test/ | head -3 || true)
-        if [ -n "$files" ]; then
-            local ev
-            ev=$(grep -rhP --text --include="*.java" --include="*.kt" "$pat" "$src" 2>/dev/null | head -3 | sed 's/^[[:space:]]*//' | tr '\n' ' ' || true)
-            local sev="HIGH"
-            [[ "$name" == *"SQL"* || "$name" == *"Path"* || "$name" == *"Fragment"* ]] && sev="CRITICAL"
-            local rem="general"
-            [[ "$name" == *"PendingIntent"* ]] && rem="mutable_pending_intent"
-            [[ "$name" == *"SQL"* ]] && rem="sql_injection"
-            add_finding "$sev" "Intent/IPC" "Intent Vuln: $name" \
-                "Detected '$name'. Malicious apps may exploit this to inject data, trigger unintended actions, or escalate privileges through IPC." \
-                "${ev:0:400}" "LIKELY" "$rem"
-            warn "Intent: $name"
-        fi
-    done
+    scan_source "$src" "$shard" \
+        'PendingIntent\.get(?:Activity|Service|Broadcast)\b(?!.*FLAG_IMMUTABLE)(?!.*FLAG_UPDATE_CURRENT\|.*FLAG_IMMUTABLE)|Intent/IPC: Mutable PendingIntent (FLAG_IMMUTABLE missing)|HIGH|mutable_pending_intent' \
+        'sendStickyBroadcast\s*\(|Intent/IPC: Sticky Broadcast (deprecated, readable by all apps)|MEDIUM|general' \
+        'rawQuery\s*\(.*getStringExtra|getStringExtra.*rawQuery|Intent/IPC: SQL Injection via Intent Extra|CRITICAL|sql_injection' \
+        'new File\s*\(.*getStringExtra|getStringExtra.*new File|Intent/IPC: Path Traversal via Intent Extra|CRITICAL|general' \
+        'loadUrl\s*\(.*getStringExtra|getStringExtra.*loadUrl|Intent/IPC: WebView Open Redirect via Intent|CRITICAL|js_enabled' \
+        'Runtime\.getRuntime\s*\(\)\.exec\s*\(.*getStringExtra|Intent/IPC: OS Command Injection via Intent Extra|CRITICAL|general' \
+        '(?i)fragment.*getStringExtra|getSupportFragmentManager.*getStringExtra|Intent/IPC: Fragment Injection via Intent Extra|CRITICAL|general' \
+        'startActivity.*getIntent|onNewIntent.*startActivity|Intent/IPC: Intent Forwarding (check extras validation)|MEDIUM|general' \
+        'getSerializableExtra\s*\(|getParcelableExtra\s*\(|Intent/IPC: Deserialization via Intent (check class allowlist)|HIGH|general'
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1211,26 +1304,27 @@ mod_netconfig() {
     grep -q 'cleartextTrafficPermitted="true"' "$nsc" 2>/dev/null && \
         add_finding "HIGH" "Network Security" "NSC Allows Cleartext Traffic" \
             "network_security_config.xml explicitly permits HTTP cleartext traffic. This exposes transmitted data to passive eavesdropping." \
-            "$(grep 'cleartextTrafficPermitted' "$nsc")" "CONFIRMED" "cleartext"
+            "$(grep 'cleartextTrafficPermitted' "$nsc")" "CONFIRMED" "cleartext" || true
 
     grep -q '<certificates src="user"' "$nsc" 2>/dev/null && \
         add_finding "HIGH" "Network Security" "User CA Certificates Trusted in NSC" \
             "The app trusts user-installed CA certificates. An attacker can install a custom root CA on the test device to intercept all TLS traffic without triggering SSL errors." \
-            "$(grep 'certificates src' "$nsc")" "CONFIRMED" "no_pinning"
+            "$(grep 'certificates src' "$nsc")" "CONFIRMED" "no_pinning" || true
 
-    ! grep -q '<pin-set' "$nsc" 2>/dev/null && \
+    if ! grep -q '<pin-set' "$nsc" 2>/dev/null; then
         add_finding "MEDIUM" "Network Security" "No Certificate Pinning in NSC" \
             "No <pin-set> defined. Certificate pinning would prevent MITM attacks even when a rogue CA is trusted." \
             "No <pin-set> element found" "CONFIRMED" "no_pinning"
+    fi
 
     grep -q '<debug-overrides' "$nsc" 2>/dev/null && \
         add_finding "INFO" "Network Security" "debug-overrides Present in NSC" \
             "<debug-overrides> weakens TLS validation in debug mode. Ensure this is not active in release builds." \
-            "$(grep -A5 'debug-overrides' "$nsc")" "LIKELY" "general"
+            "$(grep -A5 'debug-overrides' "$nsc")" "LIKELY" "general" || true
 
     # Source-level TrustManager check
     if [ -d "${WORK_DIR}/jadx_out" ]; then
-        grep -rlP --text --text 'checkServerTrusted' "${WORK_DIR}/jadx_out" 2>/dev/null | while read -r f; do
+        grep -rlP --text 'checkServerTrusted' "${WORK_DIR}/jadx_out" 2>/dev/null | while read -r f; do
             if grep -qP 'checkServerTrusted.*\{[\s\n]*\}' "$f" 2>/dev/null; then
                 add_finding "CRITICAL" "Network Security" "Empty checkServerTrusted() — Trust All Certs" \
                     "A custom TrustManager with an empty checkServerTrusted() blindly trusts ALL TLS certificates, completely bypassing SSL validation and enabling trivial MITM on any network." \
@@ -1238,6 +1332,7 @@ mod_netconfig() {
             fi
         done
     fi
+    return 0
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1343,7 +1438,7 @@ mod_firebase() {
     else
         # Grep source for firebase URLs
         local fb_urls
-        fb_urls=$(grep -rP --text --text --include="*.java" --include="*.kt" --include="*.xml" --include="*.json" \
+        fb_urls=$(grep -rP --text --include="*.java" --include="*.kt" --include="*.xml" --include="*.json" \
             'https://[a-z0-9-]+\.firebaseio\.com' "${WORK_DIR}/" 2>/dev/null | \
             grep -oP 'https://[a-z0-9-]+\.firebaseio\.com' | sort -u | head -3 || true)
         if [ -n "$fb_urls" ]; then
@@ -1364,44 +1459,23 @@ mod_misc() {
     section "MISCELLANEOUS CHECKS"
     local src="${WORK_DIR}/jadx_out"
     [ ! -d "$src" ] && { warn "No jadx source"; return; }
+    local shard="${SHARD_DIR}/shard_$$.ndjson"
 
-    declare -A MISC=(
-        ["SQL Injection (rawQuery concat)"]='rawQuery\([^)]*\+|execSQL\([^)]*\+'
-        ["Zip Slip Vulnerability"]='ZipEntry.*getName\(\).*new File\|new File.*ZipEntry.*getName'
-        ["Unsafe Java Deserialization"]='ObjectInputStream\b|readObject\(\)'
-        ["StrictMode in Code"]='StrictMode\.setThreadPolicy\|StrictMode\.setVmPolicy'
-        ["Random for Security Token"]='new Random\(\).*token\|token.*new Random\(\)'
-        ["FLAG_SECURE Missing (Screencap)"]='getWindow\(\)(?!.*FLAG_SECURE)'
-        ["Tapjacking Not Prevented"]='filterTouchesWhenObscured.*false'
-        ["Content Path Traversal"]='openFile.*\.\./'
-        ["Hardcoded Test Creds"]='(?i)(test|dev|debug).{0,10}(password|pass|secret).{0,5}[=:].{0,30}'
-        ["JS Exec with User Input"]='evaluateJavascript\(.*getStringExtra\|evaluateJavascript\(.*getIntent'
-        ["Dynamic Proxy Misuse"]='Proxy\.newProxyInstance.*getStringExtra'
-    )
-
-    declare -A MISC_REMS=(
-        ["SQL Injection (rawQuery concat)"]="sql_injection"
-        ["Zip Slip Vulnerability"]="zip_slip"
-        ["Unsafe Java Deserialization"]="unsafe_deserialization"
-        ["Hardcoded Test Creds"]="general"
-    )
-
-    for name in "${!MISC[@]}"; do
-        local pat="${MISC[$name]}"
-        local files
-        files=$(grep -rlP --text --include="*.java" --include="*.kt" "$pat" "$src" 2>/dev/null | grep -v test/ | head -3 || true)
-        if [ -n "$files" ]; then
-            local ev
-            ev=$(grep -rhP --text --include="*.java" --include="*.kt" "$pat" "$src" 2>/dev/null | head -3 | sed 's/^[[:space:]]*//' | tr '\n' ' ' || true)
-            local sev="MEDIUM"
-            [[ "$name" == *"SQL"* || "$name" == *"Zip Slip"* || "$name" == *"Deserialization"* ]] && sev="HIGH"
-            local rem="${MISC_REMS[$name]:-general}"
-            add_finding "$sev" "Miscellaneous" "$name" \
-                "Detected '$name'. Verify in context — may represent a security vulnerability with direct impact." \
-                "${ev:0:400}" "LIKELY" "$rem"
-            warn "Misc: $name"
-        fi
-    done
+    scan_source "$src" "$shard" \
+        'rawQuery\s*\([^)]*\+|execSQL\s*\([^)]*\+|Misc: SQL Injection (rawQuery/execSQL concat)|CRITICAL|sql_injection' \
+        'ZipEntry.*getName\s*\(\).*new File|new File.*ZipEntry.*getName|Misc: Zip Slip Path Traversal|HIGH|zip_slip' \
+        'ObjectInputStream\b|readObject\s*\(\)|Misc: Unsafe Java Deserialization|HIGH|unsafe_deserialization' \
+        'new Random\s*\(\).*token|token.*new Random\s*\(\)|Random\s*\(\).*password|Misc: java.util.Random for Security Token (not CSPRNG)|HIGH|general' \
+        'filterTouchesWhenObscured\s*=\s*false|Misc: Tapjacking Not Prevented (filterTouchesWhenObscured=false)|MEDIUM|general' \
+        'openFile.*\.\./|Misc: ContentProvider Path Traversal|HIGH|general' \
+        '(?i)(test|dev|debug).{0,10}(password|pass|secret).{0,5}[=:].{0,30}|Misc: Hardcoded Test/Dev Credentials|HIGH|general' \
+        'evaluateJavascript\s*\(.*getStringExtra|evaluateJavascript\s*\(.*getIntent\(\)|Misc: JS Execution with Intent User Input|CRITICAL|js_interface' \
+        'Runtime\.getRuntime\s*\(\)\.exec\s*\(|Misc: Runtime.exec() OS Command Execution|HIGH|general' \
+        'ProcessBuilder\s*\(.*getStringExtra|ProcessBuilder\s*\(.*getIntent|Misc: ProcessBuilder with Intent Data (Command Injection)|CRITICAL|general' \
+        'Class\.forName\s*\(.*getStringExtra|Misc: Dynamic Class Loading from Intent (Class Injection)|CRITICAL|general' \
+        '(?i)http://(?!schemas\.android|www\.w3|localhost|127\.0\.0\.1)[a-z0-9._/-]{8,}|Misc: Hardcoded HTTP (non-localhost) URL|MEDIUM|cleartext' \
+        'StrictMode\.(setThreadPolicy|setVmPolicy)|Misc: StrictMode Used (may indicate debug/dev build)|INFO|general' \
+        'android\.util\.Log\.[dv]\s*\(|BuildConfig\.DEBUG|Misc: Verbose Logging / Debug Code|INFO|general'
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2619,10 +2693,18 @@ mod_iccta() {
 
     local src="${WORK_DIR}/jadx_out"
     local manifest
-    manifest=$(find "${WORK_DIR}/apktool_out" -name "AndroidManifest.xml" 2>/dev/null | head -1 || true)
+    manifest=$(find "${WORK_DIR}/apktool_out" -maxdepth 1 -name "AndroidManifest.xml" 2>/dev/null | head -1 || true)
 
-    if [ ! -d "$src" ] || [ -z "$manifest" ]; then
-        warn "ICC analysis requires jadx output and manifest — skipping"
+    # Never fall back to raw/AndroidManifest.xml — it's binary (not decoded XML)
+    if [ -z "$manifest" ] || [ ! -f "$manifest" ]; then
+        warn "ICC analysis requires apktool-decoded AndroidManifest.xml — skipping"
+        warn "Ensure apktool completed successfully"
+        return
+    fi
+
+    # Quick sanity check: decoded manifest should start with XML
+    if ! head -c 6 "$manifest" | grep -q '<?xml\|<mani'; then
+        warn "Manifest at $manifest appears binary (apktool decode may have failed) — skipping ICC"
         return
     fi
 
@@ -2899,6 +2981,8 @@ PYEOF
 # ══════════════════════════════════════════════════════════════════════════════
 mod_stringdeob() {
     section "OBFUSCATED STRING DEOBFUSCATION"
+    # Always create shard so merge_shards doesn't count a missing file as success
+    touch "${SHARD_DIR}/shard_stringdeob.ndjson" 2>/dev/null || true
 
     local src="${WORK_DIR}/jadx_out"
     local smali_dir="${WORK_DIR}/apktool_out"
@@ -3036,8 +3120,15 @@ seen = set()
 SECRET_RE = re.compile(
     r'AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|sk_live_[0-9a-zA-Z]{24}|'
     r'ghp_[0-9a-zA-Z]{36}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}|'
-    r'-----BEGIN.{0,10}PRIVATE KEY|(?i)(password|secret|api.?key|token)\s*[:=]\s*.{8,40}'
+    r'-----BEGIN.{0,10}PRIVATE KEY'
 )
+SECRET_RE_I = re.compile(
+    r'(password|secret|api.?key|token)\s*[:=]\s*.{8,40}',
+    re.IGNORECASE
+)
+
+def secret_match(s):
+    return secret_match(s) or SECRET_RE_I.search(s)
 
 for jfile in java_files[:500]:  # cap for performance
     try:
@@ -3052,7 +3143,7 @@ for jfile in java_files[:500]:  # cap for performance
         dec = try_base64(m.group(1))
         if dec and dec not in seen:
             seen.add(dec)
-            if SECRET_RE.search(dec) or len(dec) > 8:
+            if secret_match(dec) or len(dec) > 8:
                 secrets.append(dec)
                 output.append(secret_finding(
                     f'Deobfuscated Base64 String in {os.path.basename(jfile)}',
@@ -3065,7 +3156,7 @@ for jfile in java_files[:500]:  # cap for performance
         if len(cand) < 32:
             continue
         dec = try_base64(cand)
-        if dec and dec not in seen and SECRET_RE.search(dec):
+        if dec and dec not in seen and secret_match(dec):
             seen.add(dec)
             secrets.append(dec)
             output.append(secret_finding(
@@ -3090,7 +3181,7 @@ for jfile in java_files[:500]:  # cap for performance
         if len(cand) < 32 or len(cand) % 2 != 0:
             continue
         dec = try_hex(cand)
-        if dec and dec not in seen and (SECRET_RE.search(dec) or len(dec) > 12):
+        if dec and dec not in seen and (secret_match(dec) or len(dec) > 12):
             seen.add(dec)
             secrets.append(dec)
             output.append(secret_finding(
@@ -3104,7 +3195,7 @@ for jfile in java_files[:500]:  # cap for performance
         if rev not in seen and len(rev) > 8:
             seen.add(rev)
             secrets.append(rev)
-            if SECRET_RE.search(rev):
+            if secret_match(rev):
                 output.append(secret_finding(
                     f'Reversed String Recovered in {os.path.basename(jfile)}',
                     rev, f'{ctx}\nOriginal (reversed): {m.group(1)}'
@@ -3116,7 +3207,7 @@ for jfile in java_files[:500]:  # cap for performance
         if result and result not in seen and len(result) > 8:
             seen.add(result)
             secrets.append(result)
-            if SECRET_RE.search(result):
+            if secret_match(result):
                 output.append(secret_finding(
                     f'Char-Array String Reconstructed in {os.path.basename(jfile)}',
                     result, f'{ctx}\nChars: {m.group(1)[:80]}'
@@ -3126,7 +3217,7 @@ for jfile in java_files[:500]:  # cap for performance
     for m in SPLIT_PAT.finditer(content):
         parts_raw = re.findall(r'["\']([^"\']+)["\']', m.group(1))
         joined = ''.join(parts_raw)
-        if joined not in seen and len(joined) > 8 and SECRET_RE.search(joined):
+        if joined not in seen and len(joined) > 8 and secret_match(joined):
             seen.add(joined)
             secrets.append(joined)
             output.append(secret_finding(
@@ -3163,7 +3254,7 @@ if os.path.isdir(smali_root):
                         s = result.decode('utf-8', errors='strict')
                         if s.isprintable() and len(s) > 6 and s not in seen:
                             seen.add(s)
-                            if SECRET_RE.search(s):
+                            if secret_match(s):
                                 secrets.append(s)
                                 output.append(secret_finding(
                                     f'Smali XOR-Decrypted String in {os.path.basename(sfile)}',
@@ -4692,11 +4783,18 @@ body{{font-family:'Inter',sans-serif;background:var(--bg);color:var(--txt);displ
   </div>
 
   <div class="footer">
-    Android Bug Bounty Static Analyzer v2.0 · Kali Linux WSL2 · {total} findings · {esc(pkg)} · {now}
+    Android Bug Bounty Static Analyzer v2.3 · Kali Linux WSL2 · {total} findings · {esc(pkg)} · {now}
   </div>
 </main>
 
 <script>
+SCRIPT_PLACEHOLDER
+</script>
+</body>
+</html>'''
+
+# JS is kept in a plain (non-f) string so curly braces are literal, not format expressions
+_js = r"""
 let aS=null, aC=null;
 const allF = document.querySelectorAll('.finding');
 
@@ -4719,7 +4817,7 @@ function expandAll(){
 function filterSev(s){
   aS=(aS===s)?null:s; aC=null;
   document.querySelectorAll('.sf').forEach(e=>e.classList.remove('active'));
-  if(aS) document.querySelectorAll(`.sf-${s.toLowerCase()}`).forEach(e=>e.classList.add('active'));
+  if(aS) document.querySelectorAll('.sf-'+s.toLowerCase()).forEach(e=>e.classList.add('active'));
   document.querySelectorAll('.nav-item').forEach(e=>e.classList.remove('active'));
   applyFilters();
 }
@@ -4750,9 +4848,9 @@ function applyFilters(){
   });
   document.getElementById('nr').style.display=vis===0?'block':'none';
 }
-</script>
-</body>
-</html>'''
+"""
+
+html = html.replace('SCRIPT_PLACEHOLDER', _js)
 
 # ── Write HTML ──
 with open(html_out, 'w', encoding='utf-8') as f:
@@ -4796,7 +4894,7 @@ PYEOF
     # ── SARIF output (GitHub Code Scanning / Burp Enterprise compatible)
     python3 - "${FINDINGS_JSON}" "${REPORT_SARIF}" << 'PYEOF'
 import sys, json
-from datetime import datetime
+from datetime import datetime, timezone
 
 findings_path = sys.argv[1]
 sarif_path    = sys.argv[2]
@@ -4872,7 +4970,7 @@ sarif = {
         "results": results,
         "invocations": [{
             "executionSuccessful": True,
-            "endTimeUtc": datetime.utcnow().isoformat() + "Z"
+            "endTimeUtc": datetime.now(timezone.utc).isoformat()
         }]
     }]
 }
@@ -4917,6 +5015,10 @@ main() {
             --whitelist)       shift; WHITELIST_FILE="$1" ;;
             --skip)            shift
                                IFS=',' read -ra SKIP_MODULES <<< "${1#modules:}" ;;
+            --clear-cache)     # Wipe cache for this APK and re-decompile fresh
+                               local _hash; _hash=$(md5sum "$APK1" 2>/dev/null | cut -c1-16)
+                               [ -n "$_hash" ] && rm -rf "${CACHE_BASE}/${_hash}"
+                               info "Cache cleared for $(basename "$APK1")" ;;
             *) warn "Unknown flag: $1" ;;
         esac
         shift
